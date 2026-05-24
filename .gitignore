@@ -1,0 +1,12 @@
+node_modules/
+*.db
+*.db-shm
+*.db-wal
+output/
+logs/
+.env
+credentials.json
+*.key.json
+dist/
+coverage/
+.DS_Store

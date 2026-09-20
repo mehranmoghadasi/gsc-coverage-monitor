@@ -1,158 +1,158 @@
 /**
- * detector.js — Coverage drift & regression detection engine
+ * detector.js — pure regression logic. No I/O, fully unit-tested.
  *
- * Algorithm:
- *   1. Compute a rolling baseline (mean) of indexed URLs over the last N days
- *      (configurable window, default 7).
- *   2. Compare the most recent snapshot's indexed URL count against the baseline.
- *   3. If the drop exceeds the configured threshold (default 5%), flag as regression.
- *   4. Apply a minimum-history guard: at least 3 snapshots required to avoid
- *      false positives on brand-new properties.
- *   5. Emit structured regression objects for downstream alerting.
+ * Three independent signals, each grounded in a GSC endpoint that really
+ * returns data:
+ *   1. Search Analytics (site level)  → impression collapse
+ *   2. Search Analytics (page level)  → pages that vanished from search
+ *   3. URL Inspection                 → index-state flips (indexed → not)
+ *   4. Sitemaps                       → submitted-count drops, new errors
  */
 
 /**
- * @typedef {Object} SnapshotRow
- * @property {string} site_url
- * @property {string} poll_date
- * @property {number} indexed_urls
- * @property {number} submitted_urls
- * @property {number} error_urls
+ * @typedef {{date:string, clicks:number, impressions:number}} DailyRow
+ * @typedef {{page:string, clicks:number, impressions:number}} PageRow
+ * @typedef {{type:string, subject:string, baseline:number, current:number, dropPct:number, severity:'high'|'medium'|'low', details:object}} Regression
  */
 
-/**
- * @typedef {Object} Regression
- * @property {string} siteUrl
- * @property {string} detectedDate
- * @property {number} baselineAvg      - Mean indexed URL count over the window
- * @property {number} currentIndexed   - Today's indexed URL count
- * @property {number} dropPct          - Percentage drop (positive = drop)
- * @property {number} dropAbsolute     - Absolute URL count lost
- * @property {'threshold'|'total_loss'} type
- */
-
-const MIN_SNAPSHOTS_REQUIRED = 3;
-
-/**
- * Analyse a single property's historical snapshots and return any detected regression.
- *
- * @param {string}        siteUrl    - Property URL being analysed
- * @param {SnapshotRow[]} snapshots  - Ordered oldest-first, filtered to window period
- * @param {object}        opts
- * @param {number}        opts.threshold  - % drop that triggers a regression
- * @param {number}        opts.window     - Rolling window in days
- * @returns {Regression | null}
- */
-export function detectRegression(siteUrl, snapshots, opts) {
-  const { threshold } = opts;
-
-  if (snapshots.length < MIN_SNAPSHOTS_REQUIRED) {
-    return null; // Not enough history for meaningful comparison
-  }
-
-  // Baseline = average of all snapshots except the most recent
-  const history = snapshots.slice(0, -1);
-  const current = snapshots[snapshots.length - 1];
-
-  const baselineAvg = history.reduce((sum, s) => sum + s.indexed_urls, 0) / history.length;
-
-  if (baselineAvg === 0) {
-    return null; // Avoid division-by-zero on brand-new or unindexed properties
-  }
-
-  const dropAbsolute = baselineAvg - current.indexed_urls;
-  const dropPct = (dropAbsolute / baselineAvg) * 100;
-
-  if (dropPct >= threshold) {
-    return {
-      siteUrl,
-      detectedDate: current.poll_date,
-      baselineAvg: Math.round(baselineAvg),
-      currentIndexed: current.indexed_urls,
-      dropPct: Math.round(dropPct * 10) / 10, // 1 decimal
-      dropAbsolute: Math.round(dropAbsolute),
-      type: 'threshold',
-    };
-  }
-
-  // Secondary check: total loss (indexed_urls === 0 and history had > 0)
-  if (current.indexed_urls === 0 && baselineAvg > 0) {
-    return {
-      siteUrl,
-      detectedDate: current.poll_date,
-      baselineAvg: Math.round(baselineAvg),
-      currentIndexed: 0,
-      dropPct: 100,
-      dropAbsolute: Math.round(baselineAvg),
-      type: 'total_loss',
-    };
-  }
-
-  return null;
+function pct(base, cur) {
+  if (base <= 0) return 0;
+  return Math.round(((base - cur) / base) * 1000) / 10;
 }
 
 /**
- * Run regression detection across all properties.
- *
- * @param {object}                   db        - better-sqlite3 Database instance
- * @param {string[]}                 siteUrls  - All configured property URLs
- * @param {object}                   opts      - Detector options { threshold, window }
- * @param {Function}                 getRecent - (db, siteUrl, days) => SnapshotRow[]
- * @returns {Regression[]}
+ * Site-level impression drift: average daily impressions in the recent window vs baseline.
+ * @param {DailyRow[]} baselineRows
+ * @param {DailyRow[]} recentRows
+ * @param {{siteDropThresholdPct:number}} cfg
+ * @returns {Regression|null}
  */
-export function detectAllRegressions(db, siteUrls, opts, getRecent) {
-  const regressions = [];
-
-  for (const siteUrl of siteUrls) {
-    const snapshots = getRecent(db, siteUrl, opts.window + 1); // +1 for current day
-    const regression = detectRegression(siteUrl, snapshots, opts);
-    if (regression) {
-      regressions.push(regression);
-    }
-  }
-
-  return regressions;
-}
-
-/**
- * Compute portfolio-level coverage health summary across all properties.
- * Useful for the daily summary report even when no regressions are found.
- *
- * @param {object[]} latestSnapshots - Most recent snapshot per property
- * @returns {object}
- */
-export function computeHealthSummary(latestSnapshots) {
-  const total = latestSnapshots.length;
-  const totalIndexed = latestSnapshots.reduce((s, r) => s + (r.indexed_urls ?? 0), 0);
-  const totalSubmitted = latestSnapshots.reduce((s, r) => s + (r.submitted_urls ?? 0), 0);
-  const totalErrors = latestSnapshots.reduce((s, r) => s + (r.error_urls ?? 0), 0);
-  const coverageRate = totalSubmitted > 0
-    ? Math.round((totalIndexed / totalSubmitted) * 1000) / 10
-    : null;
-
+export function siteImpressionDrop(baselineRows, recentRows, cfg) {
+  if (!baselineRows.length || !recentRows.length) return null;
+  const avg = (rows) => rows.reduce((s, r) => s + r.impressions, 0) / rows.length;
+  const base = avg(baselineRows);
+  const cur = avg(recentRows);
+  if (base < 10) return null; // too little traffic for a ratio to mean anything
+  const drop = pct(base, cur);
+  if (drop < cfg.siteDropThresholdPct) return null;
   return {
-    propertyCount: total,
-    totalIndexed,
-    totalSubmitted,
-    totalErrors,
-    coverageRate,
-    computedAt: new Date().toISOString(),
+    type: 'site_impressions_drop',
+    subject: 'site',
+    baseline: Math.round(base),
+    current: Math.round(cur),
+    dropPct: drop,
+    severity: drop >= 50 ? 'high' : 'medium',
+    details: { baselineDays: baselineRows.length, recentDays: recentRows.length },
   };
 }
 
 /**
- * Format a regression into a human-readable alert message.
- *
- * @param {Regression} regression
- * @returns {string}
+ * Pages that had steady impressions in the baseline window and none (or almost none) recently.
+ * These are the pages most likely to have been de-indexed, redirected, or blocked.
+ * @param {PageRow[]} baselinePages  aggregated over the baseline window
+ * @param {PageRow[]} recentPages    aggregated over the recent window
+ * @param {{pageMinBaselineImpressions:number, baselineDays:number, recentDays:number}} cfg
+ * @returns {Regression[]}
  */
-export function formatRegressionMessage(regression) {
-  const verb = regression.type === 'total_loss' ? '🚨 TOTAL LOSS' : '⚠️  DROP DETECTED';
-  return [
-    `${verb} — ${regression.siteUrl}`,
-    `  Date:              ${regression.detectedDate}`,
-    `  Baseline (avg):    ${regression.baselineAvg.toLocaleString()} indexed URLs`,
-    `  Current:           ${regression.currentIndexed.toLocaleString()} indexed URLs`,
-    `  Drop:              ${regression.dropPct}% (−${regression.dropAbsolute.toLocaleString()} URLs)`,
-  ].join('\n');
+export function vanishedPages(baselinePages, recentPages, cfg) {
+  const recent = new Map(recentPages.map((r) => [r.page, r]));
+  const out = [];
+  for (const b of baselinePages) {
+    if (b.impressions < cfg.pageMinBaselineImpressions) continue;
+    const r = recent.get(b.page);
+    // Normalise both windows to impressions/day so unequal window lengths compare fairly.
+    const basePerDay = b.impressions / cfg.baselineDays;
+    const curPerDay = (r?.impressions ?? 0) / cfg.recentDays;
+    const drop = pct(basePerDay, curPerDay);
+    if (drop < 90) continue;
+    out.push({
+      type: 'page_vanished',
+      subject: b.page,
+      baseline: Math.round(basePerDay * 10) / 10,
+      current: Math.round(curPerDay * 10) / 10,
+      dropPct: drop,
+      severity: b.clicks > 0 ? 'high' : 'medium',
+      details: { baselineClicks: b.clicks, baselineImpressions: b.impressions, recentImpressions: r?.impressions ?? 0 },
+    });
+  }
+  return out.sort((a, b) => b.details.baselineImpressions - a.details.baselineImpressions);
+}
+
+/** Map a URL Inspection result to a coarse bucket we can diff over time. */
+export function indexBucket(inspection) {
+  const verdict = inspection?.verdict ?? 'VERDICT_UNSPECIFIED';
+  const state = inspection?.coverageState ?? '';
+  if (verdict === 'PASS') return 'indexed';
+  if (/^discovered/i.test(state)) return 'pending'; // "Discovered - currently not indexed": never crawled yet
+  if (/not indexed|excluded|noindex|blocked|redirect|soft 404|404|error|duplicate|alternate/i.test(state) || verdict === 'FAIL') return 'not_indexed';
+  return 'unknown';
+}
+
+/**
+ * Compare the previous and current inspection of the same URL.
+ * @param {object|null} prev  row from the inspections table (may be null)
+ * @param {object} curr       fresh inspection
+ * @returns {Regression|null}
+ */
+export function inspectionTransition(prev, curr) {
+  const before = prev ? indexBucket(prev) : null;
+  const after = indexBucket(curr);
+  if (before === 'indexed' && after === 'not_indexed') {
+    return {
+      type: 'index_lost',
+      subject: curr.url,
+      baseline: 1,
+      current: 0,
+      dropPct: 100,
+      severity: 'high',
+      details: { from: prev.coverageState, to: curr.coverageState, robots: curr.robotsTxtState, lastCrawl: curr.lastCrawlTime },
+    };
+  }
+  if (after === 'not_indexed' && curr.userCanonical && curr.googleCanonical && curr.userCanonical !== curr.googleCanonical) {
+    return {
+      type: 'canonical_mismatch',
+      subject: curr.url,
+      baseline: 0,
+      current: 0,
+      dropPct: 0,
+      severity: 'medium',
+      details: { userCanonical: curr.userCanonical, googleCanonical: curr.googleCanonical, state: curr.coverageState },
+    };
+  }
+  if (after === 'not_indexed' && /blocked by robots/i.test(curr.coverageState ?? '') && before !== 'not_indexed') {
+    return {
+      type: 'robots_blocked',
+      subject: curr.url,
+      baseline: 0,
+      current: 0,
+      dropPct: 0,
+      severity: 'high',
+      details: { state: curr.coverageState, robots: curr.robotsTxtState },
+    };
+  }
+  return null;
+}
+
+/**
+ * Sitemap-level problems: submitted count fell sharply, sitemap now errors, or it stopped being fetched.
+ * @param {object|null} prev previous snapshot row for this sitemap path
+ * @param {object} curr current snapshot
+ * @param {{submittedDropThresholdPct:number}} cfg
+ * @returns {Regression[]}
+ */
+export function sitemapIssues(prev, curr, cfg) {
+  const out = [];
+  if (prev && prev.submitted > 0) {
+    const drop = pct(prev.submitted, curr.submitted);
+    if (drop >= cfg.submittedDropThresholdPct) {
+      out.push({ type: 'sitemap_shrank', subject: curr.path, baseline: prev.submitted, current: curr.submitted, dropPct: drop, severity: drop >= 50 ? 'high' : 'medium', details: {} });
+    }
+  }
+  if (curr.errors > 0 && (!prev || curr.errors > prev.errors)) {
+    out.push({ type: 'sitemap_errors', subject: curr.path, baseline: prev?.errors ?? 0, current: curr.errors, dropPct: 0, severity: 'medium', details: { warnings: curr.warnings } });
+  }
+  if (curr.isPending && prev && !prev.isPending) {
+    out.push({ type: 'sitemap_pending', subject: curr.path, baseline: 0, current: 0, dropPct: 0, severity: 'low', details: { lastDownloaded: curr.lastDownloaded } });
+  }
+  return out;
 }

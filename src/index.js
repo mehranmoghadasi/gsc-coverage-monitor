@@ -1,230 +1,142 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node --no-warnings=ExperimentalWarning
 /**
- * gsc-coverage-monitor — CLI entry point
+ * gsc-monitor — CLI entry point.
  *
- * Commands:
- *   poll     Poll all configured GSC properties, store snapshots, detect regressions,
- *            dispatch alerts if configured.
- *   report   Print a summary of recent coverage data from the local database.
- *   list     List all GSC properties the configured account has access to.
- *   status   Show snapshot counts and the most recent poll date per property.
- *
- * Usage:
- *   node src/index.js poll [--config path/to/config.json]
- *   node src/index.js report [--days 30]
- *   node src/index.js list
- *   node src/index.js status
+ *   gsc-monitor poll     run one monitoring pass over every property, alert on new issues
+ *   gsc-monitor report   Markdown/JSON report for the last N days
+ *   gsc-monitor status   one-line health per property
+ *   gsc-monitor inspect  ad-hoc URL Inspection for one or more URLs
  */
+import { parseArgs } from 'node:util';
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { loadDotEnv, loadConfig, envSettings } from './config.js';
+import { openDatabase, pendingRegressions, markNotified } from './lib/db.js';
+import { isoDate } from './lib/dates.js';
+import { pollProperty } from './lib/poll.js';
+import { formatDigest, sendWebhook, appendAlertsCsv } from './lib/alerts.js';
+import { buildReport, renderMarkdown } from './lib/report.js';
+import { fetchSitemapUrls } from './lib/sitemap.js';
 
-import { program } from 'commander';
-import chalk from 'chalk';
-import { loadConfig } from './config.js';
-import { createAuthClient, verifyAuth } from './lib/auth.js';
-import { fetchAllSnapshots, listAccessibleProperties } from './lib/gsc.js';
-import {
-  openDatabase,
-  upsertSnapshots,
-  getRecentSnapshots,
-  getLatestSnapshots,
-  insertRegression,
-  getPendingRegressions,
-  markRegressionAlerted,
-  getSnapshotCounts,
-} from './lib/db.js';
-import { detectAllRegressions, computeHealthSummary } from './lib/detector.js';
-import { sendEmailAlert, writeAlertCsv, writeSnapshotCsv } from './lib/alerts.js';
-import { printSummaryTable, writePlainReport } from './lib/report.js';
+const HELP = `gsc-monitor <command> [options]
 
-const PKG_VERSION = '1.0.0';
+Commands:
+  poll                 fetch analytics + sitemaps + inspect a URL sample; store; alert on new issues
+  report               write a Markdown (+JSON) report      --days 30  --out reports/
+  status               print a one-line summary per property
+  inspect <url...>     run URL Inspection on the given URLs (counts against quota)
 
-program
-  .name('gsc-monitor')
-  .description('Multi-property Google Search Console coverage drift monitor')
-  .version(PKG_VERSION);
+Options:
+  --config <path>      default gsc-monitor.json (or $GSC_MONITOR_CONFIG)
+  --property <siteUrl> limit poll/inspect to one property
+  --dry-run            poll without sending webhook alerts
+  --today <YYYY-MM-DD> override "today" (testing / backfill)
+  -h, --help
+`;
 
-// ── poll ─────────────────────────────────────────────────────────────────────
-program
-  .command('poll')
-  .description('Poll all configured GSC properties and detect coverage regressions')
-  .option('-c, --config <path>', 'Path to JSON config file')
-  .option('--dry-run', 'Fetch and analyse data but do not persist or alert')
-  .action(async (opts) => {
-    console.log(chalk.bold.cyan('\n🔍 GSC Coverage Monitor — Poll Cycle\n'));
+async function buildApi() {
+  // Test hook: GSC_MONITOR_FAKE_API=./path/to/module.js exporting a default api object.
+  if (process.env.GSC_MONITOR_FAKE_API) return (await import(new URL(process.env.GSC_MONITOR_FAKE_API, `file://${process.cwd()}/`))).default;
+  const { createAuth, createClients, queryDaily, queryPages, listSitemaps, inspectUrl } = await import('./lib/gsc.js');
+  const { credentialsPath } = envSettings();
+  const auth = await createAuth(credentialsPath);
+  const clients = createClients(auth);
+  return {
+    queryDaily: (site, a, b) => queryDaily(clients, site, a, b),
+    queryPages: (site, a, b) => queryPages(clients, site, a, b),
+    listSitemaps: (site) => listSitemaps(clients, site),
+    inspectUrl: (site, url) => inspectUrl(clients, site, url),
+    fetchSitemapUrls: (u) => fetchSitemapUrls(u),
+  };
+}
 
-    let config;
-    try {
-      config = loadConfig(opts.config);
-    } catch (err) {
-      console.error(chalk.red(`Config error: ${err.message}`));
-      process.exit(1);
+export async function main(argv = process.argv.slice(2)) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      config: { type: 'string' }, property: { type: 'string' }, days: { type: 'string', default: '30' },
+      out: { type: 'string', default: 'reports' }, 'dry-run': { type: 'boolean', default: false },
+      today: { type: 'string' }, help: { type: 'boolean', short: 'h', default: false },
+    },
+  });
+  const [command, ...rest] = positionals;
+  if (values.help || !command) { process.stdout.write(HELP); return 0; }
+
+  loadDotEnv();
+  const cfg = loadConfig(values.config);
+  const env = envSettings();
+  const db = openDatabase(env.dbPath);
+  const today = values.today ?? isoDate();
+  process.env.GSC_MONITOR_TODAY = today;
+  const labels = Object.fromEntries(cfg.properties.map((p) => [p.siteUrl, p.label]));
+  const props = values.property ? cfg.properties.filter((p) => p.siteUrl === values.property) : cfg.properties;
+  if (!props.length) throw new Error(`property not in config: ${values.property}`);
+
+  if (command === 'poll') {
+    const api = await buildApi();
+    let total = 0;
+    for (const p of props) {
+      process.stdout.write(`▶ ${p.label} (${p.siteUrl})\n`);
+      try {
+        const r = await pollProperty({ db, api, cfg, property: p, today, log: (m) => process.stdout.write(`${m}\n`) });
+        total += r.regressions.length;
+        process.stdout.write(`  ${r.regressions.length} new issue(s) · ${r.pagesTracked} URLs tracked\n`);
+      } catch (err) {
+        process.stdout.write(`  ✖ ${err.message}\n`);
+      }
     }
-
-    const auth = await createAuthClient(config.googleKeyFile);
-    try {
-      await verifyAuth(auth);
-    } catch (err) {
-      console.error(chalk.red(`Auth error: ${err.message}`));
-      process.exit(1);
-    }
-
-    const siteUrls = config.properties.map((p) => p.siteUrl);
-    console.log(chalk.gray(`Polling ${siteUrls.length} propert${siteUrls.length === 1 ? 'y' : 'ies'}...`));
-
-    const snapshots = await fetchAllSnapshots(auth, siteUrls);
-    const today = new Date().toISOString().slice(0, 10);
-
-    if (!opts.dryRun) {
-      const db = openDatabase(config.dbPath);
-      upsertSnapshots(db, snapshots);
-      console.log(chalk.gray(`Snapshots stored → ${config.dbPath}`));
-
-      // Detect regressions
-      const regressions = detectAllRegressions(
-        db,
-        siteUrls,
-        { threshold: config.alerts.threshold, window: config.alerts.window },
-        getRecentSnapshots
-      );
-
-      for (const r of regressions) {
-        insertRegression(db, r);
+    const pending = pendingRegressions(db);
+    if (pending.length) {
+      const digest = formatDigest(pending, labels);
+      process.stdout.write(`\n${digest}\n`);
+      appendAlertsCsv(`${values.out}/alerts.csv`, pending);
+      if (!values['dry-run'] && env.webhookUrl) {
+        await sendWebhook(env.webhookUrl, digest);
+        process.stdout.write(`\n✔ alert sent to webhook\n`);
       }
-
-      const latestSnapshots = getLatestSnapshots(db, siteUrls);
-      const summary = computeHealthSummary(latestSnapshots);
-
-      printSummaryTable(latestSnapshots, regressions, summary);
-
-      const pendingRegressions = getPendingRegressions(db);
-
-      // CSV export
-      if (config.alerts.csv) {
-        const snapshotCsvPath = await writeSnapshotCsv(config.outputDir, snapshots, today);
-        console.log(chalk.gray(`Snapshot CSV → ${snapshotCsvPath}`));
-
-        if (pendingRegressions.length > 0) {
-          const alertCsvPath = await writeAlertCsv(config.outputDir, pendingRegressions, today);
-          console.log(chalk.yellow(`Alert CSV → ${alertCsvPath}`));
-        }
-      }
-
-      // Report
-      const reportPath = writePlainReport(config.outputDir, latestSnapshots, pendingRegressions, summary, today);
-      console.log(chalk.gray(`Report → ${reportPath}`));
-
-      // Email alerts
-      if (config.alerts.email && pendingRegressions.length > 0) {
-        try {
-          await sendEmailAlert(config.smtp, pendingRegressions, summary);
-          for (const r of pendingRegressions) {
-            markRegressionAlerted(db, r.id);
-          }
-          console.log(chalk.yellow(`✉  Alert email sent to ${config.smtp.to}`));
-        } catch (err) {
-          console.error(chalk.red(`Email send failed: ${err.message}`));
-        }
-      }
-
-      db.close();
+      markNotified(db, pending.map((r) => r.id), new Date().toISOString());
     } else {
-      // Dry-run: just print what would happen
-      console.log(chalk.yellow('\n[dry-run] Snapshots fetched but not stored.\n'));
-      for (const s of snapshots) {
-        console.log(`  ${s.siteUrl}: ${s.indexedUrls ?? 'error'} indexed`);
-      }
+      process.stdout.write('\n✔ no new issues\n');
     }
+    return total ? 1 : 0;
+  }
 
-    console.log(chalk.green('\n✔  Poll cycle complete.\n'));
-  });
+  if (command === 'report') {
+    const rep = buildReport(db, cfg, Number(values.days), today);
+    mkdirSync(values.out, { recursive: true });
+    const md = `${values.out}/report-${today}.md`;
+    writeFileSync(md, renderMarkdown(rep));
+    writeFileSync(`${values.out}/report-${today}.json`, JSON.stringify(rep, null, 2));
+    process.stdout.write(renderMarkdown(rep));
+    process.stdout.write(`\nSaved ${md}\n`);
+    return 0;
+  }
 
-// ── report ────────────────────────────────────────────────────────────────────
-program
-  .command('report')
-  .description('Print a coverage summary from stored snapshot data')
-  .option('-c, --config <path>', 'Path to JSON config file')
-  .option('--days <n>', 'Number of days of history to include', '30')
-  .action(async (opts) => {
-    let config;
-    try {
-      config = loadConfig(opts.config);
-    } catch (err) {
-      console.error(chalk.red(`Config error: ${err.message}`));
-      process.exit(1);
+  if (command === 'status') {
+    const rep = buildReport(db, cfg, 7, today);
+    for (const s of rep.sites) {
+      const open = rep.regressions.filter((r) => r.siteUrl === s.siteUrl && r.severity === 'high').length;
+      process.stdout.write(`${open ? '🔴' : '🟢'} ${s.label.padEnd(24)} 7d: ${s.clicks.toLocaleString()} clicks / ${s.impressions.toLocaleString()} impr · ${s.knownUrls} URLs · ${open} high-severity\n`);
     }
+    return 0;
+  }
 
-    const db = openDatabase(config.dbPath);
-    const siteUrls = config.properties.map((p) => p.siteUrl);
-    const latestSnapshots = getLatestSnapshots(db, siteUrls);
-
-    if (latestSnapshots.length === 0) {
-      console.log(chalk.yellow('\nNo snapshot data found. Run `gsc-monitor poll` first.\n'));
-      db.close();
-      return;
+  if (command === 'inspect') {
+    if (!rest.length) throw new Error('inspect needs at least one URL');
+    const api = await buildApi();
+    const p = props[0];
+    for (const url of rest) {
+      const r = await api.inspectUrl(p.siteUrl, url);
+      process.stdout.write(`${r.verdict.padEnd(8)} ${r.coverageState.padEnd(40)} ${url}\n`);
+      if (r.googleCanonical && r.googleCanonical !== url) process.stdout.write(`         canonical → ${r.googleCanonical}\n`);
     }
+    return 0;
+  }
 
-    const summary = computeHealthSummary(latestSnapshots);
-    const pendingRegressions = getPendingRegressions(db);
-    printSummaryTable(latestSnapshots, pendingRegressions, summary);
+  throw new Error(`unknown command: ${command}\n\n${HELP}`);
+}
 
-    db.close();
-  });
-
-// ── list ──────────────────────────────────────────────────────────────────────
-program
-  .command('list')
-  .description('List all GSC properties accessible with the configured credentials')
-  .option('-c, --config <path>', 'Path to JSON config file')
-  .action(async (opts) => {
-    let config;
-    try {
-      config = loadConfig(opts.config);
-    } catch (err) {
-      console.error(chalk.red(`Config error: ${err.message}`));
-      process.exit(1);
-    }
-
-    const auth = await createAuthClient(config.googleKeyFile);
-    const properties = await listAccessibleProperties(auth);
-
-    if (properties.length === 0) {
-      console.log(chalk.yellow('\nNo GSC properties found for this account.\n'));
-      return;
-    }
-
-    console.log(chalk.bold.cyan('\nAccessible GSC Properties:\n'));
-    for (const p of properties) {
-      console.log(`  • ${p}`);
-    }
-    console.log('');
-  });
-
-// ── status ────────────────────────────────────────────────────────────────────
-program
-  .command('status')
-  .description('Show snapshot count and last poll date per property')
-  .option('-c, --config <path>', 'Path to JSON config file')
-  .action(async (opts) => {
-    let config;
-    try {
-      config = loadConfig(opts.config);
-    } catch (err) {
-      console.error(chalk.red(`Config error: ${err.message}`));
-      process.exit(1);
-    }
-
-    const db = openDatabase(config.dbPath);
-    const counts = getSnapshotCounts(db);
-
-    console.log(chalk.bold.cyan('\nSnapshot Status:\n'));
-    if (counts.length === 0) {
-      console.log(chalk.yellow('  No snapshots stored yet. Run `gsc-monitor poll` first.\n'));
-    } else {
-      for (const row of counts) {
-        console.log(`  ${row.siteUrl}  →  ${row.count} snapshot(s)`);
-      }
-      console.log('');
-    }
-    db.close();
-  });
-
-program.parse(process.argv);
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().then((code) => process.exit(code)).catch((err) => { process.stderr.write(`error: ${err.message}\n`); process.exit(2); });
+}

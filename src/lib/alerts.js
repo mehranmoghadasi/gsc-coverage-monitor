@@ -1,159 +1,61 @@
-/**
- * alerts.js — Alert dispatch: email via Nodemailer and CSV export
- *
- * Handles sending regression alerts by email and writing per-cycle
- * CSV alert files to the output directory.
- */
+/** alerts.js — format regressions for humans and push them to a webhook / CSV. */
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 
-import nodemailer from 'nodemailer';
-import { createWriteStream, mkdirSync, existsSync } from 'fs';
-import { resolve, join } from 'path';
-import { format as formatCsv } from 'fast-csv';
-import { formatRegressionMessage } from './detector.js';
+const LABEL = {
+  site_impressions_drop: 'Impressions collapsed',
+  page_vanished: 'Page vanished from search',
+  index_lost: 'URL dropped out of the index',
+  canonical_mismatch: 'Google chose a different canonical',
+  robots_blocked: 'URL now blocked by robots.txt',
+  sitemap_shrank: 'Sitemap lost URLs',
+  sitemap_errors: 'Sitemap has errors',
+  sitemap_pending: 'Sitemap not yet processed',
+};
 
-/**
- * Send an email alert for one or more regressions.
- *
- * @param {object}     smtp         - SMTP configuration from config.js
- * @param {object[]}   regressions  - Array of Regression objects
- * @param {object}     summary      - Health summary object
- * @returns {Promise<void>}
- */
-export async function sendEmailAlert(smtp, regressions, summary) {
-  if (!smtp) {
-    throw new Error('SMTP configuration is required to send email alerts.');
+export function describe(r) {
+  switch (r.type) {
+    case 'site_impressions_drop': return `${r.baseline.toLocaleString()} → ${r.current.toLocaleString()} impressions/day (−${r.dropPct}%)`;
+    case 'page_vanished': return `${r.baseline}/day → ${r.current}/day impressions (${r.details.baselineClicks} clicks in baseline)`;
+    case 'index_lost': return `${r.details.from} → ${r.details.to}${r.details.robots ? ` · robots: ${r.details.robots}` : ''}`;
+    case 'canonical_mismatch': return `declared ${r.details.userCanonical} · Google picked ${r.details.googleCanonical}`;
+    case 'robots_blocked': return r.details.state;
+    case 'sitemap_shrank': return `${r.baseline.toLocaleString()} → ${r.current.toLocaleString()} submitted URLs (−${r.dropPct}%)`;
+    case 'sitemap_errors': return `${r.current} errors, ${r.details.warnings ?? 0} warnings`;
+    case 'sitemap_pending': return 'Google has not fetched this sitemap since submission';
+    default: return JSON.stringify(r.details);
   }
-
-  const transporter = nodemailer.createTransport({
-    host: smtp.host,
-    port: smtp.port,
-    secure: smtp.secure,
-    auth: { user: smtp.user, pass: smtp.pass },
-    connectionTimeout: 10_000,
-    greetingTimeout: 5_000,
-  });
-
-  const subject = regressions.length === 1
-    ? `⚠️ GSC Coverage Alert: ${regressions[0].siteUrl}`
-    : `⚠️ GSC Coverage Alerts (${regressions.length} properties)`;
-
-  const textLines = [
-    `GSC COVERAGE MONITOR — ${new Date().toISOString()}`,
-    `Properties Monitored: ${summary.propertyCount}`,
-    `Total Indexed: ${summary.totalIndexed.toLocaleString()} / ${summary.totalSubmitted.toLocaleString()} submitted (${summary.coverageRate ?? 'N/A'}%)`,
-    '',
-    '── REGRESSIONS DETECTED ──────────────────────────────',
-    '',
-    ...regressions.map(formatRegressionMessage),
-    '',
-    '── NEXT STEPS ────────────────────────────────────────',
-    '1. Open Google Search Console for each flagged property.',
-    '2. Check the Coverage → Index report for new errors or exclusions.',
-    '3. Inspect affected URLs using the URL Inspection tool.',
-    '4. Review recent site changes (deploys, robots.txt, canonical tags).',
-  ];
-
-  const htmlLines = [
-    '<html><body style="font-family: monospace; font-size: 14px;">',
-    `<h2>⚠️ GSC Coverage Monitor Alert</h2>`,
-    `<p><strong>Date:</strong> ${new Date().toISOString()}</p>`,
-    `<p><strong>Properties:</strong> ${summary.propertyCount} | <strong>Total Indexed:</strong> ${summary.totalIndexed.toLocaleString()} / ${summary.totalSubmitted.toLocaleString()} (${summary.coverageRate ?? 'N/A'}%)</p>`,
-    '<hr>',
-    ...regressions.map((r) => `
-      <div style="background:#fff3cd;border:1px solid #ffc107;padding:12px;margin:8px 0;border-radius:4px;">
-        <strong>${r.type === 'total_loss' ? '🚨 TOTAL LOSS' : '⚠️ DROP'} — ${r.siteUrl}</strong><br>
-        Baseline avg: ${r.baselineAvg.toLocaleString()} → Current: ${r.currentIndexed.toLocaleString()}<br>
-        <span style="color:red;font-weight:bold;">Drop: ${r.dropPct}% (−${r.dropAbsolute.toLocaleString()} URLs)</span>
-      </div>`),
-    '</body></html>',
-  ];
-
-  await transporter.sendMail({
-    from: smtp.from,
-    to: smtp.to,
-    subject,
-    text: textLines.join('\n'),
-    html: htmlLines.join('\n'),
-  });
 }
 
-/**
- * Write regression alerts to a CSV file in the output directory.
- *
- * @param {string}   outputDir   - Directory to write alert files
- * @param {object[]} regressions - Array of Regression objects
- * @param {string}   date        - YYYY-MM-DD date string for file naming
- * @returns {Promise<string>}    - Absolute path of the written CSV file
- */
-export async function writeAlertCsv(outputDir, regressions, date) {
-  if (!existsSync(outputDir)) {
-    mkdirSync(outputDir, { recursive: true });
-  }
-
-  const filename = `gsc-alerts-${date}.csv`;
-  const filePath = join(outputDir, filename);
-
-  return new Promise((resolve, reject) => {
-    const ws = createWriteStream(filePath);
-    const csvStream = formatCsv({ headers: true });
-
-    csvStream.pipe(ws);
-
-    for (const r of regressions) {
-      csvStream.write({
-        site_url: r.siteUrl,
-        detected_date: r.detectedDate,
-        type: r.type,
-        baseline_avg: r.baselineAvg,
-        current_indexed: r.currentIndexed,
-        drop_pct: r.dropPct,
-        drop_absolute: r.dropAbsolute,
-      });
+/** Group by property, order by severity. Returns Markdown that reads fine in Slack/Discord/Teams too. */
+export function formatDigest(regressions, labels = {}) {
+  if (!regressions.length) return '';
+  const order = { high: 0, medium: 1, low: 2 };
+  const icon = { high: '🔴', medium: '🟠', low: '🟡' };
+  const bySite = new Map();
+  for (const r of regressions) bySite.set(r.siteUrl, [...(bySite.get(r.siteUrl) ?? []), r]);
+  const lines = [`*GSC Coverage Monitor — ${regressions.length} new issue${regressions.length === 1 ? '' : 's'}*`];
+  for (const [site, list] of bySite) {
+    lines.push('', `*${labels[site] ?? site}*`);
+    for (const r of list.sort((a, b) => order[a.severity] - order[b.severity])) {
+      lines.push(`${icon[r.severity]} ${LABEL[r.type] ?? r.type} — ${r.subject === 'site' ? '' : `${r.subject} — `}${describe(r)}`);
     }
-
-    csvStream.end();
-
-    ws.on('finish', () => resolve(filePath));
-    ws.on('error', reject);
-  });
+  }
+  return lines.join('\n');
 }
 
-/**
- * Write a daily health snapshot CSV (all properties, no regressions only).
- *
- * @param {string}   outputDir
- * @param {object[]} snapshots  - Latest snapshots array
- * @param {string}   date
- * @returns {Promise<string>}
- */
-export async function writeSnapshotCsv(outputDir, snapshots, date) {
-  if (!existsSync(outputDir)) {
-    mkdirSync(outputDir, { recursive: true });
+export async function sendWebhook(url, text, fetchImpl = fetch) {
+  if (!url) return false;
+  const res = await fetchImpl(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, content: text }) });
+  if (!res.ok) throw new Error(`webhook responded ${res.status}`);
+  return true;
+}
+
+export function appendAlertsCsv(path, regressions) {
+  mkdirSync(dirname(path), { recursive: true });
+  if (!existsSync(path)) writeFileSync(path, 'detected_at,site_url,severity,type,subject,baseline,current,drop_pct,details\n');
+  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  for (const r of regressions) {
+    appendFileSync(path, [r.detectedAt, r.siteUrl, r.severity, r.type, r.subject, r.baseline, r.current, r.dropPct, JSON.stringify(r.details)].map(esc).join(',') + '\n');
   }
-
-  const filename = `gsc-snapshot-${date}.csv`;
-  const filePath = join(outputDir, filename);
-
-  return new Promise((resolve, reject) => {
-    const ws = createWriteStream(filePath);
-    const csvStream = formatCsv({ headers: true });
-    csvStream.pipe(ws);
-
-    for (const s of snapshots) {
-      csvStream.write({
-        site_url: s.siteUrl ?? s.site_url,
-        date: s.date ?? s.poll_date,
-        submitted_urls: s.submittedUrls ?? s.submitted_urls,
-        indexed_urls: s.indexedUrls ?? s.indexed_urls,
-        error_urls: s.errorUrls ?? s.error_urls,
-        warning_urls: s.warningUrls ?? s.warning_urls,
-        excluded_urls: s.excludedUrls ?? s.excluded_urls,
-        sitemap_count: s.sitemapCount ?? s.sitemap_count,
-      });
-    }
-
-    csvStream.end();
-    ws.on('finish', () => resolve(filePath));
-    ws.on('error', reject);
-  });
 }

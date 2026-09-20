@@ -218,5 +218,5 @@ MIT — see [LICENSE](LICENSE).
 
 ## About the Author
 
-**Mehran Moghadasi** — Digital Marketing & Brand Manager (SEO · Google Ads · Meta Ads · Social Media), Calgary, AB. 13+ years keeping client sites visible, and tired of finding out about de-indexed pages from the monthly report.
+**Mehran Moghadasi** — Digital Marketing & Brand Manager (SEO · Google Ads · Meta Ads · Social Media), Calgary, AB.
 [github.com/mehranmoghadasi](https://github.com/mehranmoghadasi) · [linkedin.com/in/mehranmoghadasi](https://www.linkedin.com/in/mehranmoghadasi)

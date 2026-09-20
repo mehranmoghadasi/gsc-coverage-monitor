@@ -1,0 +1,4 @@
+{
+  "properties": [{ "siteUrl": "sc-domain:demo.example.com", "label": "Demo HVAC Co", "sitemaps": ["https://demo.example.com/sitemap.xml"] }],
+  "inspection": { "dailyBudget": 10 }
+}

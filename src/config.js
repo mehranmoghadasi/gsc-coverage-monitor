@@ -1,141 +1,90 @@
 /**
- * config.js — Configuration loader for gsc-coverage-monitor
+ * config.js — load and validate gsc-monitor.json + environment.
  *
- * Reads from environment variables (loaded via dotenv) and an optional
- * JSON config file. Validates required fields and returns a typed config object.
+ * Nothing here talks to the network. Every default is documented in
+ * gsc-monitor.example.json so a reviewer can see the knobs at a glance.
  */
+import { readFileSync, existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 
-import { readFileSync, existsSync } from 'fs';
-import { resolve } from 'path';
-import 'dotenv/config';
+export const DEFAULTS = Object.freeze({
+  analytics: Object.freeze({
+    dataLagDays: 3, // GSC Search Analytics data is final ~2–3 days after the fact
+    baselineDays: 28,
+    recentDays: 7,
+    siteDropThresholdPct: 25,
+    pageMinBaselineImpressions: 20,
+  }),
+  inspection: Object.freeze({
+    dailyBudget: 50, // URL Inspection quota is 2,000/day/property; stay well under
+    recheckIntervalDays: 14,
+  }),
+  sitemaps: Object.freeze({
+    submittedDropThresholdPct: 20,
+  }),
+});
 
-/**
- * @typedef {Object} PropertyConfig
- * @property {string} siteUrl    - GSC property URL, e.g. "https://example.com/" or "sc-domain:example.com"
- * @property {string} [label]   - Human-readable label for reports
- */
+const SITE_URL_RE = /^(sc-domain:[a-z0-9.-]+|https?:\/\/[^\s/]+\/.*)$/i;
 
-/**
- * @typedef {Object} AlertConfig
- * @property {boolean} email     - Send email alerts when regressions detected
- * @property {boolean} csv       - Export CSV alert file each poll cycle
- * @property {number}  threshold - % drop in indexed URLs that triggers a regression (default 5)
- * @property {number}  window    - Rolling average window in days (default 7)
- */
-
-/**
- * @typedef {Object} SmtpConfig
- * @property {string} host
- * @property {number} port
- * @property {boolean} secure
- * @property {string} user
- * @property {string} pass
- * @property {string} from
- * @property {string} to
- */
-
-/**
- * @typedef {Object} AppConfig
- * @property {PropertyConfig[]} properties
- * @property {AlertConfig}      alerts
- * @property {SmtpConfig|null}  smtp
- * @property {string}           dbPath
- * @property {string}           outputDir
- * @property {number}           lookbackDays  - Days of data to consider when polling
- */
-
-/**
- * Load and validate application configuration.
- * Priority: config file > environment variables > defaults.
- *
- * @param {string} [configPath] - Optional path to JSON config file
- * @returns {AppConfig}
- */
-export function loadConfig(configPath) {
-  let fileConfig = {};
-
-  const resolvedPath = configPath
-    ? resolve(configPath)
-    : resolve(process.cwd(), 'gsc-monitor.config.json');
-
-  if (existsSync(resolvedPath)) {
-    try {
-      const raw = readFileSync(resolvedPath, 'utf8');
-      fileConfig = JSON.parse(raw);
-    } catch (err) {
-      throw new Error(`Failed to parse config file at ${resolvedPath}: ${err.message}`);
-    }
+/** Read a minimal .env file into process.env (no dependency on dotenv). */
+export function loadDotEnv(path = '.env') {
+  if (!existsSync(path)) return;
+  for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/i);
+    if (!m || line.trim().startsWith('#')) continue;
+    if (process.env[m[1]] === undefined) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
   }
-
-  // ── Properties ───────────────────────────────────────────────────────────
-  const properties = fileConfig.properties ?? parsePropertiesFromEnv();
-  if (!Array.isArray(properties) || properties.length === 0) {
-    throw new Error(
-      'No GSC properties configured. Set GSC_PROPERTIES in .env or provide a config file.'
-    );
-  }
-  for (const p of properties) {
-    if (!p.siteUrl || typeof p.siteUrl !== 'string') {
-      throw new Error(`Each property must have a "siteUrl" string. Got: ${JSON.stringify(p)}`);
-    }
-  }
-
-  // ── Alert settings ────────────────────────────────────────────────────────
-  const alerts = {
-    email: fileConfig.alerts?.email ?? (process.env.ALERT_EMAIL === 'true'),
-    csv: fileConfig.alerts?.csv ?? (process.env.ALERT_CSV !== 'false'), // default on
-    threshold: Number(fileConfig.alerts?.threshold ?? process.env.ALERT_THRESHOLD ?? 5),
-    window: Number(fileConfig.alerts?.window ?? process.env.ALERT_WINDOW ?? 7),
-  };
-
-  // ── SMTP ──────────────────────────────────────────────────────────────────
-  const smtp = (alerts.email || fileConfig.smtp)
-    ? {
-        host: fileConfig.smtp?.host ?? process.env.SMTP_HOST,
-        port: Number(fileConfig.smtp?.port ?? process.env.SMTP_PORT ?? 587),
-        secure: fileConfig.smtp?.secure ?? (process.env.SMTP_SECURE === 'true'),
-        user: fileConfig.smtp?.user ?? process.env.SMTP_USER,
-        pass: fileConfig.smtp?.pass ?? process.env.SMTP_PASS,
-        from: fileConfig.smtp?.from ?? process.env.SMTP_FROM,
-        to: fileConfig.smtp?.to ?? process.env.SMTP_TO,
-      }
-    : null;
-
-  if (alerts.email && smtp) {
-    for (const field of ['host', 'user', 'pass', 'from', 'to']) {
-      if (!smtp[field]) {
-        throw new Error(`SMTP field "${field}" is required when email alerts are enabled.`);
-      }
-    }
-  }
-
-  // ── Paths ─────────────────────────────────────────────────────────────────
-  const dbPath = fileConfig.dbPath ?? process.env.DB_PATH ?? resolve(process.cwd(), 'gsc-monitor.db');
-  const outputDir = fileConfig.outputDir ?? process.env.OUTPUT_DIR ?? resolve(process.cwd(), 'output');
-  const lookbackDays = Number(fileConfig.lookbackDays ?? process.env.LOOKBACK_DAYS ?? 28);
-
-  // ── Google auth ───────────────────────────────────────────────────────────
-  const googleKeyFile = fileConfig.googleKeyFile ?? process.env.GOOGLE_APPLICATION_CREDENTIALS;
-  if (!googleKeyFile) {
-    throw new Error(
-      'Google credentials not configured. Set GOOGLE_APPLICATION_CREDENTIALS in .env or provide googleKeyFile in the config.'
-    );
-  }
-
-  return { properties, alerts, smtp, dbPath, outputDir, lookbackDays, googleKeyFile };
 }
 
 /**
- * Parse GSC_PROPERTIES env var into PropertyConfig[].
- * Format: comma-separated URLs, e.g. "https://a.com/,sc-domain:b.com"
- *
- * @returns {PropertyConfig[]}
+ * Merge a raw JSON object with DEFAULTS and validate it.
+ * @param {object} raw
+ * @returns {{properties: Array<{siteUrl:string,label:string,sitemaps:string[]}>, analytics: object, inspection: object, sitemaps: object}}
  */
-function parsePropertiesFromEnv() {
-  const raw = process.env.GSC_PROPERTIES ?? '';
-  return raw
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((siteUrl) => ({ siteUrl }));
+export function normalizeConfig(raw) {
+  if (!raw || typeof raw !== 'object') throw new Error('config must be a JSON object');
+  if (!Array.isArray(raw.properties) || raw.properties.length === 0) {
+    throw new Error('config.properties must be a non-empty array');
+  }
+  const properties = raw.properties.map((p, i) => {
+    if (!p || typeof p.siteUrl !== 'string' || !SITE_URL_RE.test(p.siteUrl)) {
+      throw new Error(`properties[${i}].siteUrl must look like "sc-domain:example.com" or "https://example.com/"`);
+    }
+    return {
+      siteUrl: p.siteUrl,
+      label: typeof p.label === 'string' && p.label.trim() ? p.label.trim() : p.siteUrl,
+      sitemaps: Array.isArray(p.sitemaps) ? p.sitemaps.filter((s) => typeof s === 'string') : [],
+    };
+  });
+  const seen = new Set();
+  for (const p of properties) {
+    if (seen.has(p.siteUrl)) throw new Error(`duplicate property: ${p.siteUrl}`);
+    seen.add(p.siteUrl);
+  }
+  const section = (name) => {
+    const merged = { ...DEFAULTS[name], ...(raw[name] ?? {}) };
+    for (const [k, v] of Object.entries(merged)) {
+      if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) throw new Error(`${name}.${k} must be a non-negative number`);
+    }
+    return merged;
+  };
+  const cfg = { properties, analytics: section('analytics'), inspection: section('inspection'), sitemaps: section('sitemaps') };
+  if (cfg.inspection.dailyBudget > 2000) throw new Error('inspection.dailyBudget cannot exceed the 2,000/day URL Inspection quota');
+  if (cfg.analytics.recentDays >= cfg.analytics.baselineDays) throw new Error('analytics.recentDays must be smaller than baselineDays');
+  return cfg;
+}
+
+/** Load config from disk (default ./gsc-monitor.json). */
+export function loadConfig(path = process.env.GSC_MONITOR_CONFIG ?? 'gsc-monitor.json') {
+  const abs = resolve(path);
+  if (!existsSync(abs)) throw new Error(`config not found: ${abs} (copy gsc-monitor.example.json to get started)`);
+  return normalizeConfig(JSON.parse(readFileSync(abs, 'utf8')));
+}
+
+export function envSettings() {
+  return {
+    credentialsPath: process.env.GOOGLE_APPLICATION_CREDENTIALS ?? '',
+    webhookUrl: process.env.ALERT_WEBHOOK_URL ?? '',
+    dbPath: process.env.GSC_MONITOR_DB ?? './data/gsc-monitor.db',
+  };
 }

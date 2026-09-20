@@ -1,0 +1,20 @@
+{
+  "properties": [
+    { "siteUrl": "sc-domain:example.com", "label": "Example Co", "sitemaps": ["https://example.com/sitemap.xml"] },
+    { "siteUrl": "https://shop.example.ca/", "label": "Example Shop" }
+  ],
+  "analytics": {
+    "dataLagDays": 3,
+    "baselineDays": 28,
+    "recentDays": 7,
+    "siteDropThresholdPct": 25,
+    "pageMinBaselineImpressions": 20
+  },
+  "inspection": {
+    "dailyBudget": 50,
+    "recheckIntervalDays": 14
+  },
+  "sitemaps": {
+    "submittedDropThresholdPct": 20
+  }
+}

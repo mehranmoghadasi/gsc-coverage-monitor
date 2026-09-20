@@ -1,6 +1,6 @@
 # gsc-coverage-monitor
 
-[![Tests](https://img.shields.io/badge/tests-19%20passing-brightgreen?logo=node.js&logoColor=white)](tests/)
+[![CI](https://github.com/mehranmoghadasi/gsc-coverage-monitor/actions/workflows/node.js.yml/badge.svg)](https://github.com/mehranmoghadasi/gsc-coverage-monitor/actions/workflows/node.js.yml)
 [![Node 22.13+](https://img.shields.io/badge/node-22.13%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-1%20(googleapis)-06B6D4)](package.json)
@@ -203,7 +203,7 @@ gsc-coverage-monitor/
 │       └── dates.js
 ├── tests/                  # node:test — detector, db, sitemap, alerts, full poll incident
 ├── examples/               # fake-api.js + demo config (no credentials needed)
-├── ci/node.yml             # GitHub Actions workflow (copy to .github/workflows/)
+├── ci/node.yml             # GitHub Actions workflow (also installed at .github/workflows/)
 ├── gsc-monitor.example.json
 └── .env.example
 ```
